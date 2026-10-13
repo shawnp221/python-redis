@@ -1,5 +1,6 @@
 import socket  # noqa: F401
 import threading
+import time
 
 data_store = {}  # In-memory data store for SET and GET commands
 data_lock = threading.Lock()  # Lock to ensure thread-safe access to the data store
@@ -63,27 +64,66 @@ def handle_client(connection):
                     connection.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
 
             elif command_name == b"SET":
-                if len(command) == 3:
-                    key = command[1]
-                    value = command[2]
-                    with data_lock:
-                        data_store[key] = value
-                    connection.sendall(b"+OK\r\n")
-                else:
+                if len(command) < 3:
                     connection.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
+                    continue
+
+                key = command[1]
+                value = command[2]
+                expiry = None
+
+                i = 3
+                while i < len(command):
+                    expiry_option = command[i].upper()
+                    if expiry_option == b"EX" and i + 1 < len(command):
+                        try:
+                            seconds = int(command[i + 1])
+                            expiry = time.monotonic() + seconds
+                        except ValueError:
+                            connection.sendall(b"-ERR invalid expire time\r\n")
+                            break
+
+                        i += 2
+                    elif expiry_option == b"PX" and i + 1 < len(command):
+                        try:
+                            milliseconds = int(command[i + 1])
+                            expiry = time.monotonic() + milliseconds / 1000
+                        except ValueError:
+                            connection.sendall(b"-ERR invalid expire time\r\n")
+                            break
+
+                        i += 2
+                    else:
+                        connection.sendall(b"-ERR syntax error\r\n")
+                        break
+
+                else:
+                    with data_lock:
+                        data_store[key] = (value, expiry)
+                    connection.sendall(b"+OK\r\n")
             
             elif command_name == b"GET":
-                if len(command) == 2:
-                    key = command[1]
-                    with data_lock:
-                        value = data_store.get(key)
-                    if value is not None:
-                        response = encode_bulk_string(value)
-                        connection.sendall(response)
-                    else:
-                        connection.sendall(b"$-1\r\n")
-                else:
+                if len(command) != 2:
                     connection.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
+                    continue
+
+                key = command[1]
+
+                with data_lock:
+                    entry = data_store.get(key)
+
+                    if entry is not None:
+                        value, expiry = entry
+
+                        if expiry is not None and time.monotonic() >= expiry:
+                            del data_store[key]
+                            entry = None
+
+                if entry is None:
+                    connection.sendall(b"$-1\r\n")
+                else:
+                    connection.sendall(encode_bulk_string(value))
+
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
 
