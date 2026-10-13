@@ -1,6 +1,9 @@
 import socket  # noqa: F401
 import threading
 
+data_store = {}  # In-memory data store for SET and GET commands
+data_lock = threading.Lock()  # Lock to ensure thread-safe access to the data store
+
 
 def parse_resp(data):
     # Example input: b"*2\r\n$4\r\nECHO\r\n$3\r\nhey"
@@ -59,6 +62,28 @@ def handle_client(connection):
                 else:
                     connection.sendall(b"-ERR wrong number of arguments for 'echo' command\r\n")
 
+            elif command_name == b"SET":
+                if len(command) == 3:
+                    key = command[1]
+                    value = command[2]
+                    with data_lock:
+                        data_store[key] = value
+                    connection.sendall(b"+OK\r\n")
+                else:
+                    connection.sendall(b"-ERR wrong number of arguments for 'set' command\r\n")
+            
+            elif command_name == b"GET":
+                if len(command) == 2:
+                    key = command[1]
+                    with data_lock:
+                        value = data_store.get(key)
+                    if value is not None:
+                        response = encode_bulk_string(value)
+                        connection.sendall(response)
+                    else:
+                        connection.sendall(b"$-1\r\n")
+                else:
+                    connection.sendall(b"-ERR wrong number of arguments for 'get' command\r\n")
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
 
