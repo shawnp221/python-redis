@@ -5,6 +5,9 @@ import time
 data_store = {}  # In-memory data store for SET and GET commands
 data_lock = threading.Lock()  # Lock to ensure thread-safe access to the data store
 
+list_store = {} # In-memory data store for RPUSH command
+list_lock = threading.Lock()  # Lock to ensure thread-safe access to the list store
+
 
 def parse_resp(data):
     # Example input: b"*2\r\n$4\r\nECHO\r\n$3\r\nhey"
@@ -123,6 +126,21 @@ def handle_client(connection):
                     connection.sendall(b"$-1\r\n")
                 else:
                     connection.sendall(encode_bulk_string(value))
+
+            elif command_name == b"RPUSH":
+                if len(command) < 3:
+                    connection.sendall(b"-ERR wrong number of arguments for 'rpush' command\r\n")
+                    continue
+                
+                key = command[1]
+                elements = command[2:]
+
+                with list_lock:
+                    if key not in list_store:   
+                        list_store[key] = []    # create the list if it doesn't exist
+                    list_store[key].extend(elements)  # add elements to the list
+                    length = len(list_store[key])
+                connection.sendall(f":{length}\r\n".encode())
 
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
