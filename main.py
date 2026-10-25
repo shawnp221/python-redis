@@ -43,6 +43,15 @@ def encode_bulk_string(data):
     length = len(data)
     return f"${length}\r\n".encode() + data + b"\r\n"
 
+
+def encode_array(data_list):
+    # Encode an array in RESP format
+    result = f"*{len(data_list)}\r\n".encode()
+    for item in data_list:
+        result += encode_bulk_string(item)
+    return result
+
+
 def handle_client(connection):
     try:
         while True:
@@ -141,6 +150,53 @@ def handle_client(connection):
                     list_store[key].extend(elements)  # add elements to the list
                     length = len(list_store[key])
                 connection.sendall(f":{length}\r\n".encode())
+
+            elif command_name == b"LPUSH":
+                if len(command) < 3:
+                    connection.sendall(b"-ERR wrong number of arguments for 'lpush' command\r\n")
+                    continue
+                
+                key = command[1]
+                elements = command[2:]
+
+                with list_lock:
+                    if key not in list_store:   
+                        list_store[key] = []    # create the list if it doesn't exist
+                    list_store[key] = elements[::-1] + list_store[key]  # add elements to the list
+                    length = len(list_store[key])
+                connection.sendall(f":{length}\r\n".encode())
+
+            elif command_name == b"LRANGE":
+                if len(command) != 4:
+                    connection.sendall(b"-ERR wrong number of arguments for 'lrange' command\r\n")
+                    continue
+
+                key = command[1]
+                try:
+                    start = int(command[2])
+                    stop = int(command[3])
+                except ValueError:
+                    connection.sendall(b"-ERR start and stop must be integers\r\n")
+                    continue
+
+                with list_lock:
+                    items = list_store.get(key, []) # missing list -> empty
+                    length = len(items)
+
+                    # Convert negative indexes to offsets from the end
+                    if start < 0:
+                        start = max(length + start, 0)   # too far back -> clamp to first element
+                    if stop < 0:
+                        stop = length + stop             # may stay negative -> empty result below
+
+                    if start >= length or start > stop:
+                        result = []
+                    else:
+                        stop = min(stop, length - 1)    # clamp stop to the last element
+                        result = items[start:stop + 1]  # +1 because stop is inclusive
+                    
+                    connection.sendall(encode_array(result))
+
 
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
