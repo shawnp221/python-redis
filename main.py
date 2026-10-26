@@ -8,6 +8,26 @@ data_lock = threading.Lock()  # Lock to ensure thread-safe access to the data st
 list_store = {} # In-memory data store for RPUSH command
 list_lock = threading.Lock()  # Lock to ensure thread-safe access to the list store
 
+blocked_clients = {}  # Dictionary to keep track of blocked clients for BLPOP
+
+class Waiter:
+    def __init__(self):
+        self.event = threading.Event()   # set when an element is handed over
+        self.element = None              # the element given to this client
+
+# Only call when holding list-lock
+def serve_blocked_clients(key):
+    waiters = blocked_clients.get(key)
+    items = list_store.get(key)
+
+    while waiters and items:
+        waiter = waiters.pop(0)          # longest-waiting client first
+        waiter.element = items.pop(0)    # hand the element over directly
+        waiter.event.set()               # wake that client's thread
+
+    if waiters is not None and not waiters:
+        del blocked_clients[key]
+
 
 def parse_resp(data):
     # Example input: b"*2\r\n$4\r\nECHO\r\n$3\r\nhey"
@@ -149,6 +169,7 @@ def handle_client(connection):
                         list_store[key] = []    # create the list if it doesn't exist
                     list_store[key].extend(elements)  # add elements to the list
                     length = len(list_store[key])
+                    serve_blocked_clients(key)
                 connection.sendall(f":{length}\r\n".encode())
 
             elif command_name == b"LPUSH":
@@ -164,6 +185,7 @@ def handle_client(connection):
                         list_store[key] = []    # create the list if it doesn't exist
                     list_store[key] = elements[::-1] + list_store[key]  # add elements to the list
                     length = len(list_store[key])
+                    serve_blocked_clients(key)
                 connection.sendall(f":{length}\r\n".encode())
 
             elif command_name == b"LRANGE":
@@ -197,6 +219,104 @@ def handle_client(connection):
                     
                     connection.sendall(encode_array(result))
 
+            elif command_name == b"LLEN":
+                if len(command) != 2:
+                    connection.sendall(b"-ERR wrong number of arguments for 'llen' command\r\n")
+                    continue
+
+                key = command[1]
+
+                with list_lock:
+                    length = len(list_store.get(key, []))  # missing list -> length 0
+                connection.sendall(f":{length}\r\n".encode())
+
+            elif command_name == b"LPOP":
+                if len(command) not in (2, 3):
+                    connection.sendall(b"-ERR wrong number of arguments for 'lpop' command\r\n")
+                    continue
+
+                key = command[1]
+                count = None
+
+                if len(command) == 3:
+                    try:
+                        count = int(command[2])
+                    except ValueError:
+                        connection.sendall(b"-ERR value is not an integer or out of range\r\n")
+                        continue
+                    if count < 0:
+                        connection.sendall(b"-ERR value is out of range, must be positive\r\n")
+                        continue
+
+                with list_lock:
+                    items = list_store.get(key)
+
+                    if count is None:
+                        # Original behavior: one element as a bulk string
+                        removed = items.pop(0) if items else None
+                    else:
+                        # New behavior: up to `count` elements as an array
+                        if not items:
+                            removed = None
+                        else:
+                            removed = items[:count]   # slicing past the end just returns everything
+                            del items[:count]
+
+                if count is None:
+                    if removed is None:
+                        connection.sendall(b"$-1\r\n")
+                    else:
+                        connection.sendall(encode_bulk_string(removed))
+                else:
+                    if removed is None:
+                        connection.sendall(b"*-1\r\n")        # null array, as real Redis does
+                    else:
+                        connection.sendall(encode_array(removed))
+
+            elif command_name == b"BLPOP":
+                if len(command) != 3:
+                    connection.sendall(b"-ERR wrong number of arguments for 'blpop' command\r\n")
+                    continue
+
+                key = command[1]
+                try:
+                    timeout = float(command[2])
+                except ValueError:
+                    connection.sendall(b"-ERR timeout is not a float or out of range\r\n")
+                    continue
+                if timeout < 0:
+                    connection.sendall(b"-ERR timeout is negative\r\n")
+                    continue
+
+                element = None
+                waiter = None
+
+                with list_lock:
+                    items = list_store.get(key)
+                    if items:
+                        element = items.pop(0)              # an element is already there
+                    else:
+                        waiter = Waiter()                   # otherwise join the queue
+                        blocked_clients.setdefault(key, []).append(waiter)
+
+                if waiter is not None:
+                    # Block outside the lock. timeout 0 means wait forever.
+                    waiter.event.wait(timeout if timeout > 0 else None)
+
+                    with list_lock:
+                        if waiter.element is None:
+                            # Timed out and nobody served us: leave the queue
+                            queue = blocked_clients.get(key)
+                            if queue and waiter in queue:
+                                queue.remove(waiter)
+                                if not queue:
+                                    del blocked_clients[key]
+                        element = waiter.element            # also covers "served just after the timeout"
+
+                if element is None:
+                    connection.sendall(b"*-1\r\n")          # null array on timeout
+                else:
+                    connection.sendall(encode_array([key, element]))
 
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
