@@ -8,6 +8,9 @@ data_lock = threading.Lock()  # Lock to ensure thread-safe access to the data st
 list_store = {} # In-memory data store for RPUSH command
 list_lock = threading.Lock()  # Lock to ensure thread-safe access to the list store
 
+stream_store = {} # In-memory data store for streams
+stream_lock = threading.Lock()  # Lock to ensure thread-safe access to the stream store
+
 blocked_clients = {}  # Dictionary to keep track of blocked clients for BLPOP
 
 class Waiter:
@@ -55,6 +58,23 @@ def parse_resp(data):
 
     return result
 
+def parse_entry_id(raw):
+    # b"1526919030474-0" -> (1526919030474, 0). Raises ValueError if malformed.
+    parts = raw.split(b"-")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise ValueError("invalid stream ID")
+    return int(parts[0]), int(parts[1])
+
+def parse_xadd_id(raw):
+    # b"5-3" -> (5, 3)    explicit ID
+    # b"5-*" -> (5, None) sequence number to be generated
+    # Raises ValueError if malformed.
+    if raw.endswith(b"-*"):
+        ms_part = raw[:-2]
+        if not ms_part.isdigit():
+            raise ValueError("invalid stream ID")
+        return int(ms_part), None
+    return parse_entry_id(raw)
 
 
 def encode_bulk_string(data):
@@ -317,6 +337,88 @@ def handle_client(connection):
                     connection.sendall(b"*-1\r\n")          # null array on timeout
                 else:
                     connection.sendall(encode_array([key, element]))
+
+            elif command_name == b"TYPE":
+                if len(command) != 2:
+                    connection.sendall(b"-ERR wrong number of arguments for 'type' command\r\n")
+                    continue
+
+                key = command[1]
+                key_type = b"none"
+
+                with data_lock:
+                    entry = data_store.get(key)
+                    if entry is not None:
+                        _, expiry = entry
+                        if expiry is not None and time.monotonic() >= expiry:
+                            del data_store[key]          # expired -> behaves like a missing key
+                        else:
+                            key_type = b"string"
+
+
+                if key_type == b"none":
+                    with list_lock:
+                        items = list_store.get(key)
+                        if items:                        # an emptied list counts as missing
+                            key_type = b"list"
+
+                if key_type == b"none":
+                    with stream_lock:
+                        if key in stream_store:
+                            key_type = b"stream"
+
+                connection.sendall(b"+" + key_type + b"\r\n")
+
+            elif command_name == b"XADD":
+                # XADD key id field value [field value ...]
+                if len(command) < 5 or (len(command) - 3) % 2 != 0:
+                    connection.sendall(b"-ERR wrong number of arguments for 'xadd' command\r\n")
+                    continue
+
+                key = command[1]
+
+                try:
+                    ms, seq = parse_xadd_id(command[2])      # seq is None when it must be generated
+                except ValueError:
+                    connection.sendall(b"-ERR Invalid stream ID specified as stream command argument\r\n")
+                    continue
+
+                if seq is not None and (ms, seq) == (0, 0):
+                    connection.sendall(b"-ERR The ID specified in XADD must be greater than 0-0\r\n")
+                    continue
+
+                fields = [(command[i], command[i + 1]) for i in range(3, len(command), 2)]
+                error = None
+                new_entry_id = None
+
+
+                with stream_lock:
+                    entries = stream_store.get(key)
+                    last = parse_entry_id(entries[-1]["id"]) if entries else None
+
+
+                    if seq is None:
+                        # Auto-generate the sequence number
+                        if last is not None and ms < last[0]:
+                            error = b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
+                        elif last is not None and ms == last[0]:
+                            seq = last[1] + 1                # same time part: last sequence + 1
+                        else:
+                            seq = 1 if ms == 0 else 0        # new time part: start at 0 (or 1 when ms is 0)
+                    elif last is not None and (ms, seq) <= last:
+                        error = b"-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"
+
+                    if error is None:
+                        if entries is None:
+                            entries = stream_store[key] = []     # create the stream only after validation
+                        new_entry_id = f"{ms}-{seq}".encode()
+                        entries.append({"id": new_entry_id, "fields": fields})
+
+                if error is not None:
+                    connection.sendall(error)
+                else:
+                    connection.sendall(encode_bulk_string(new_entry_id))
+
 
             else:
                 connection.sendall(b"-ERR unknown command\r\n")
